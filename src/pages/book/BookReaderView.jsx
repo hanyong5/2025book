@@ -24,10 +24,17 @@ function BookReaderView() {
   const [currentSentences, setCurrentSentences] = useState([]);
   const [elapsedTime, setElapsedTime] = useState(0);
   const [previousSentences, setPreviousSentences] = useState([]);
+  const [audioFiles, setAudioFiles] = useState({});
+  const [isAudioLoading, setIsAudioLoading] = useState(false);
+  const [audioLoadingProgress, setAudioLoadingProgress] = useState(0);
+  const [activeAudio, setActiveAudio] = useState(null);
   const intervalRef = useRef(null);
   const progressRef = useRef(0);
   const startTimerRef = useRef(null);
   const finishTimerRef = useRef(null);
+  const audioRefs = useRef({});
+  const currentSentencesRef = useRef([]);
+  const activeAudioRef = useRef(null);
 
   useEffect(() => {
     // 책 정보와 페이지 목록 가져오기
@@ -36,6 +43,21 @@ function BookReaderView() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
+
+  // pages가 로드되면 음성 파일 미리 로드
+  useEffect(() => {
+    if (
+      pages &&
+      pages.length > 0 &&
+      book &&
+      book.id &&
+      !isAudioLoading &&
+      Object.keys(audioFiles).length === 0
+    ) {
+      preloadAudioFiles(pages, book.id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pages, book]);
 
   // 책 정보와 페이지를 가져오는 함수
   const fetchBookAndPages = async (bookId) => {
@@ -103,6 +125,7 @@ function BookReaderView() {
           const startTime = sentence.s || 0;
           const endTime = sentence.e || 0;
           const text = sentence.text || sentence.t || "";
+          const sound = sentence.sound || null;
 
           // 밀리초인 경우 초로 변환
           const startInSeconds =
@@ -111,6 +134,7 @@ function BookReaderView() {
 
           return {
             text,
+            sound,
             start: startInSeconds,
             end: endInSeconds,
             duration: endInSeconds - startInSeconds,
@@ -123,6 +147,87 @@ function BookReaderView() {
 
     return null;
   }, []);
+
+  // 음성 파일 URL 생성
+  const getSoundUrl = useCallback((soundPath, bookId) => {
+    if (!soundPath) return null;
+
+    // 이미 전체 URL인 경우
+    if (soundPath.startsWith("http://") || soundPath.startsWith("https://")) {
+      return soundPath;
+    }
+
+    // 파일명만 있는 경우 (예: "02_01.mp3")
+    let fileName = soundPath.trim();
+    if (fileName.startsWith("/")) {
+      fileName = fileName.slice(1);
+    }
+
+    // books/{book_id}/sound/{파일명} 형식으로 경로 생성
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    return `${supabaseUrl}/storage/v1/object/public/books/${bookId}/sound/${fileName}`;
+  }, []);
+
+  // 모든 페이지의 음성 파일 미리 로드
+  const preloadAudioFiles = useCallback(
+    async (pages, bookId) => {
+      if (!pages || pages.length === 0 || !bookId) return;
+
+      setIsAudioLoading(true);
+      setAudioLoadingProgress(0);
+
+      const allSounds = new Set();
+      const audioMap = {};
+
+      // 모든 sentences에서 sound 추출
+      pages.forEach((page) => {
+        const sentences = parseSentences(page);
+        if (sentences) {
+          sentences.forEach((sentence) => {
+            if (sentence.sound) {
+              allSounds.add(sentence.sound);
+            }
+          });
+        }
+      });
+
+      const soundArray = Array.from(allSounds);
+      const totalSounds = soundArray.length;
+
+      if (totalSounds === 0) {
+        setIsAudioLoading(false);
+        return;
+      }
+
+      // 각 음성 파일 로드
+      for (let i = 0; i < soundArray.length; i++) {
+        const soundPath = soundArray[i];
+        const soundUrl = getSoundUrl(soundPath, bookId);
+
+        if (soundUrl) {
+          try {
+            const audio = new Audio(soundUrl);
+            audio.preload = "auto";
+
+            await new Promise((resolve, reject) => {
+              audio.addEventListener("canplaythrough", resolve, { once: true });
+              audio.addEventListener("error", reject, { once: true });
+              audio.load();
+            });
+
+            audioMap[soundPath] = audio;
+            setAudioLoadingProgress(((i + 1) / totalSounds) * 100);
+          } catch (err) {
+            console.error(`음성 파일 로드 실패: ${soundPath}`, err);
+          }
+        }
+      }
+
+      setAudioFiles(audioMap);
+      setIsAudioLoading(false);
+    },
+    [parseSentences, getSoundUrl]
+  );
 
   // text JSON에서 sentences 배열의 s, e 값을 추출하고 시간을 계산하는 함수
   const getPageTime = useCallback(
@@ -176,12 +281,28 @@ function BookReaderView() {
     navigate(`/book/${id}`);
   }, [navigate, id]);
 
-  // 시작 타이머 (5초 후 자동 시작)
+  // 시작 타이머 (5초 후 자동 시작, 음성 로드 완료 후)
   useEffect(() => {
-    if (!pagesLoading && pages && pages.length > 0 && !isStarted) {
-      startTimerRef.current = setTimeout(() => {
-        setIsStarted(true);
-      }, 5000);
+    if (
+      !pagesLoading &&
+      pages &&
+      pages.length > 0 &&
+      !isStarted &&
+      !isAudioLoading
+    ) {
+      // 음성 파일이 없어도 시작 가능
+      const hasAudio = Object.keys(audioFiles).length > 0;
+      if (!hasAudio) {
+        // 음성 파일이 없으면 바로 타이머 시작
+        startTimerRef.current = setTimeout(() => {
+          setIsStarted(true);
+        }, 5000);
+      } else {
+        // 음성 파일이 있으면 로드 완료 후 타이머 시작
+        startTimerRef.current = setTimeout(() => {
+          setIsStarted(true);
+        }, 5000);
+      }
 
       return () => {
         if (startTimerRef.current) {
@@ -190,7 +311,7 @@ function BookReaderView() {
         }
       };
     }
-  }, [pagesLoading, pages, isStarted]);
+  }, [pagesLoading, pages, isStarted, isAudioLoading, audioFiles]);
 
   // 진행 바 시작 및 sentences 표시
   useEffect(() => {
@@ -202,6 +323,7 @@ function BookReaderView() {
       if (!isStarted) {
         setElapsedTime(0);
         setCurrentSentences([]);
+        currentSentencesRef.current = [];
       }
       return;
     }
@@ -212,7 +334,29 @@ function BookReaderView() {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      // 오디오도 일시정지
+      if (activeAudioRef.current && !activeAudioRef.current.paused) {
+        activeAudioRef.current.pause();
+      }
       return;
+    }
+
+    // 재생 상태일 때 오디오도 재생
+    if (
+      activeAudioRef.current &&
+      activeAudioRef.current.paused &&
+      currentSentencesRef.current.length > 0
+    ) {
+      const currentSentence = currentSentencesRef.current.find((s) => s.sound);
+      if (
+        currentSentence &&
+        currentSentence.sound &&
+        activeAudioRef.current.src.includes(currentSentence.sound)
+      ) {
+        activeAudioRef.current.play().catch((err) => {
+          console.error("음성 재생 실패:", err);
+        });
+      }
     }
 
     const sentences = parseSentences(currentPage);
@@ -240,16 +384,37 @@ function BookReaderView() {
 
       // 이전 sentences와 비교하여 변경사항이 있을 때만 업데이트
       const hasChanged =
-        activeSentences.length !== currentSentences.length ||
+        activeSentences.length !== currentSentencesRef.current.length ||
         activeSentences.some(
           (s, i) =>
-            !currentSentences[i] ||
-            s.start !== currentSentences[i].start ||
-            s.end !== currentSentences[i].end
+            !currentSentencesRef.current[i] ||
+            s.start !== currentSentencesRef.current[i].start ||
+            s.end !== currentSentencesRef.current[i].end
         );
 
       if (hasChanged) {
-        setPreviousSentences([...currentSentences]);
+        // 이전 오디오 정지
+        if (activeAudioRef.current) {
+          activeAudioRef.current.pause();
+          activeAudioRef.current.currentTime = 0;
+          activeAudioRef.current = null;
+          setActiveAudio(null);
+        }
+
+        // 새로운 sentences의 음성 재생
+        const newSentence = activeSentences.find((s) => s.sound);
+        if (newSentence && newSentence.sound && audioFiles[newSentence.sound]) {
+          const audio = audioFiles[newSentence.sound];
+          audio.currentTime = 0;
+          audio.play().catch((err) => {
+            console.error("음성 재생 실패:", err);
+          });
+          activeAudioRef.current = audio;
+          setActiveAudio(audio);
+        }
+
+        setPreviousSentences([...currentSentencesRef.current]);
+        currentSentencesRef.current = activeSentences;
         setCurrentSentences(activeSentences);
       }
       setElapsedTime(newElapsedTime);
@@ -261,6 +426,7 @@ function BookReaderView() {
         const lastSentences = sentences.filter(
           (sentence) => sentence.end >= duration
         );
+        currentSentencesRef.current = lastSentences;
         setCurrentSentences(lastSentences);
 
         clearInterval(intervalRef.current);
@@ -289,6 +455,7 @@ function BookReaderView() {
     getPageTime,
     parseSentences,
     goToNextPage,
+    audioFiles,
   ]);
 
   // 컴포넌트 언마운트 시 타이머 정리
@@ -306,13 +473,22 @@ function BookReaderView() {
     };
   }, []);
 
-  // 페이지 변경 시 진행 바 리셋
+  // 페이지 변경 시 진행 바 리셋 및 오디오 정지
   useEffect(() => {
     setProgress(0);
     progressRef.current = 0;
     setElapsedTime(0);
     setCurrentSentences([]);
+    currentSentencesRef.current = [];
     setIsFinished(false);
+
+    // 현재 재생 중인 오디오 정지
+    if (activeAudioRef.current) {
+      activeAudioRef.current.pause();
+      activeAudioRef.current.currentTime = 0;
+      activeAudioRef.current = null;
+      setActiveAudio(null);
+    }
   }, [currentPage?.id]);
 
   // 로딩 중
@@ -391,15 +567,35 @@ function BookReaderView() {
             <h2 className="text-4xl font-bold text-white mb-8">
               {book?.title || "책 읽기"}
             </h2>
-            <button
-              onClick={handleStart}
-              className="px-8 py-4 bg-primary text-primary-foreground text-xl font-semibold rounded-lg hover:bg-primary/90 transition-colors shadow-lg"
-            >
-              시작하기
-            </button>
-            <p className="text-white/70 mt-4 text-sm">
-              5초 후 자동으로 시작됩니다
-            </p>
+
+            {isAudioLoading ? (
+              <div className="space-y-4">
+                <div className="w-64 h-2 bg-white/20 rounded-full overflow-hidden mx-auto">
+                  <div
+                    className="h-full bg-primary transition-all duration-300"
+                    style={{ width: `${audioLoadingProgress}%` }}
+                  />
+                </div>
+                <p className="text-white/70 text-sm">
+                  음성 파일을 로드하는 중... {Math.floor(audioLoadingProgress)}%
+                </p>
+              </div>
+            ) : (
+              <>
+                <button
+                  onClick={handleStart}
+                  disabled={isAudioLoading}
+                  className="px-8 py-4 bg-primary text-primary-foreground text-xl font-semibold rounded-lg hover:bg-primary/90 transition-colors shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  시작하기
+                </button>
+                <p className="text-white/70 mt-4 text-sm">
+                  {isAudioLoading
+                    ? "음성 파일 로딩 중..."
+                    : "5초 후 자동으로 시작됩니다"}
+                </p>
+              </>
+            )}
           </div>
         </div>
       </div>
